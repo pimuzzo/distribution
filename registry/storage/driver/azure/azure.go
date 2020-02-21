@@ -23,11 +23,12 @@ import (
 const driverName = "azure"
 
 const (
-	paramAccountName = "accountname"
-	paramAccountKey  = "accountkey"
-	paramContainer   = "container"
-	paramRealm       = "realm"
-	maxChunkSize     = 4 * 1024 * 1024
+	paramAccountName      = "accountname"
+	paramAccountKey       = "accountkey"
+	paramConnectionString = "connectionstring"
+	paramContainer        = "container"
+	paramRealm            = "realm"
+	maxChunkSize          = 4 * 1024 * 1024
 )
 
 type driver struct {
@@ -58,36 +59,46 @@ func FromParameters(parameters map[string]interface{}) (*Driver, error) {
 		return nil, fmt.Errorf("no %s parameter provided", paramAccountName)
 	}
 
-	accountKey, ok := parameters[paramAccountKey]
-	if !ok || fmt.Sprint(accountKey) == "" {
-		return nil, fmt.Errorf("no %s parameter provided", paramAccountKey)
-	}
-
 	container, ok := parameters[paramContainer]
 	if !ok || fmt.Sprint(container) == "" {
 		return nil, fmt.Errorf("no %s parameter provided", paramContainer)
 	}
 
-	realm, ok := parameters[paramRealm]
-	if !ok || fmt.Sprint(realm) == "" {
-		realm = azure.DefaultBaseURL
-	}
+	connectionString, ok := parameters[paramConnectionString]
+	if ok && fmt.Sprint(connectionString) != "" {
+		// Create a connection string based client
+		api, err := azure.NewClientFromConnectionString(fmt.Sprint(connectionString))
+		if err != nil {
+			return nil, err
+		}
+		return New(&api, fmt.Sprint(container))
+	} else {
+		// else look for an accountkey and realm
+		accountKey, ok := parameters[paramAccountKey]
+		if !ok || fmt.Sprint(accountKey) == "" {
+			return nil, fmt.Errorf("no %s parameter provided", paramAccountKey)
+		}
 
-	return New(fmt.Sprint(accountName), fmt.Sprint(accountKey), fmt.Sprint(container), fmt.Sprint(realm))
+		realm, ok := parameters[paramRealm]
+		if !ok || fmt.Sprint(realm) == "" {
+			realm = azure.DefaultBaseURL
+		}
+
+		api, err := azure.NewClient(fmt.Sprint(accountName), fmt.Sprint(accountKey), fmt.Sprint(realm), azure.DefaultAPIVersion, true)
+		if err != nil {
+			return nil, err
+		}
+		return New(&api, fmt.Sprint(container))
+	}
 }
 
 // New constructs a new Driver with the given Azure Storage Account credentials
-func New(accountName, accountKey, container, realm string) (*Driver, error) {
-	api, err := azure.NewClient(accountName, accountKey, realm, azure.DefaultAPIVersion, true)
-	if err != nil {
-		return nil, err
-	}
-
+func New(api *azure.Client, container string) (*Driver, error) {
 	blobClient := api.GetBlobService()
 
 	// Create registry container
 	containerRef := blobClient.GetContainerReference(container)
-	if _, err = containerRef.CreateIfNotExists(nil); err != nil {
+	if _, err := containerRef.CreateIfNotExists(nil); err != nil {
 		return nil, err
 	}
 

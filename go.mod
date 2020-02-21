@@ -3,7 +3,7 @@ module github.com/docker/distribution
 go 1.12
 
 require (
-	github.com/Azure/azure-sdk-for-go v16.2.1+incompatible
+	github.com/Azure/azure-sdk-for-go v39.2.0+incompatible
 	github.com/Azure/go-autorest v10.8.1+incompatible // indirect
 	github.com/Shopify/logrus-bugsnag v0.0.0-20171204204709-577dee27f20d
 	github.com/aws/aws-sdk-go v1.15.11
