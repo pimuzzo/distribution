@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -32,8 +33,101 @@ const (
 	maxChunkSize          = 4 * 1024 * 1024
 )
 
+type blobClient interface {
+	GetBlobReference(path string) *azure.Blob
+	GetContainerReference() *azure.Container
+	GetURLFor(blob *azure.Blob, expires time.Time) (url string, err error)
+	CreateContainer() (created bool, err error)
+}
+
+type simpleBlobClient struct {
+	client    *azure.BlobStorageClient
+	container string
+}
+
+func (client *simpleBlobClient) GetBlobReference(path string) *azure.Blob {
+	return client.GetContainerReference().GetBlobReference(path)
+}
+
+func (client *simpleBlobClient) GetContainerReference() *azure.Container {
+	return client.client.GetContainerReference(client.container)
+}
+
+func (client *simpleBlobClient) CreateContainer() (created bool, err error) {
+	return client.GetContainerReference().CreateIfNotExists(nil)
+}
+
+func (client *simpleBlobClient) GetURLFor(blob *azure.Blob, expires time.Time) (url string, err error) {
+	return blob.GetSASURI(azure.BlobSASOptions{
+		BlobServiceSASPermissions: azure.BlobServiceSASPermissions{
+			Read: true,
+		},
+		SASOptions: azure.SASOptions{
+			Expiry: expires,
+		},
+	})
+}
+
+type accountSASBlobClient struct {
+	client          *azure.BlobStorageClient
+	accountSASToken string
+	container       string
+}
+
+func NewAccountSASClient(connectionString, container string) (client *accountSASBlobClient, err error) {
+	// build a map of connection string key/value pairs
+	parts := map[string]string{}
+	for _, pair := range strings.Split(connectionString, ";") {
+		if pair == "" {
+			continue
+		}
+
+		equalDex := strings.IndexByte(pair, '=')
+		if equalDex <= 0 {
+			return nil, fmt.Errorf("Invalid connection segment %q", pair)
+		}
+
+		value := strings.TrimSpace(pair[equalDex+1:])
+		key := strings.TrimSpace(strings.ToLower(pair[:equalDex]))
+		parts[key] = value
+	}
+	accountSASToken := parts["sharedaccesssignature"]
+	if accountSASToken != "" {
+		azClient, err := azure.NewClientFromConnectionString(connectionString)
+		if err != nil {
+			return nil, err
+		}
+		api := azClient.GetBlobService()
+		sasClient := &accountSASBlobClient{
+			client:          &api,
+			accountSASToken: accountSASToken,
+			container:       container,
+		}
+		return sasClient, nil
+	}
+	return nil, errors.New("Expected a SharedAccessSignature in the connection string")
+}
+
+func (client *accountSASBlobClient) GetBlobReference(path string) *azure.Blob {
+	return client.GetContainerReference().GetBlobReference(path)
+}
+
+func (client *accountSASBlobClient) CreateContainer() (created bool, err error) {
+	return false, nil
+}
+
+func (client *accountSASBlobClient) GetContainerReference() *azure.Container {
+	return client.client.GetContainerReference(client.container)
+}
+
+func (client *accountSASBlobClient) GetURLFor(blob *azure.Blob, expires time.Time) (url string, err error) {
+	// we just append the accountSAS token and ignore the expiry
+	blobUrl := blob.GetURL()
+	return blobUrl + "?" + client.accountSASToken, nil
+}
+
 type driver struct {
-	client        azure.BlobStorageClient
+	client        blobClient
 	container     string
 	rootDirectory string
 }
@@ -69,11 +163,11 @@ func FromParameters(parameters map[string]interface{}) (*Driver, error) {
 	connectionString, ok := parameters[paramConnectionString]
 	if ok && fmt.Sprint(connectionString) != "" {
 		// Create a connection string based client
-		api, err := azure.NewClientFromConnectionString(fmt.Sprint(connectionString))
+		client, err := NewAccountSASClient(fmt.Sprint(connectionString), fmt.Sprint(container))
 		if err != nil {
 			return nil, err
 		}
-		return NewFromClient(&api, fmt.Sprint(container), fmt.Sprint(rootDirectory))
+		return NewFromClient(client, fmt.Sprint(container), fmt.Sprint(rootDirectory))
 	} else {
 		// else look for accountname, accountkey and realm
 		accountName, ok := parameters[paramAccountName]
@@ -96,17 +190,13 @@ func FromParameters(parameters map[string]interface{}) (*Driver, error) {
 }
 
 // New constructs a new Driver with the given Azure Storage Account credentials
-func NewFromClient(api *azure.Client, container string, rootDirectory string) (*Driver, error) {
-	blobClient := api.GetBlobService()
-
-	// Create registry container
-	containerRef := blobClient.GetContainerReference(container)
-	if _, err := containerRef.CreateIfNotExists(nil); err != nil {
+func NewFromClient(client blobClient, container, rootDirectory string) (*Driver, error) {
+	if _, err := client.CreateContainer(); err != nil {
 		return nil, err
 	}
 
 	d := &driver{
-		client:        blobClient,
+		client:        client,
 		container:     container,
 		rootDirectory: rootDirectory}
 	return &Driver{baseEmbed: baseEmbed{Base: base.Base{StorageDriver: d}}}, nil
@@ -118,7 +208,14 @@ func New(accountName, accountKey, container, realm, rootDirectory string) (*Driv
 	if err != nil {
 		return nil, err
 	}
-	return NewFromClient(&api, container, rootDirectory)
+
+	blobService := api.GetBlobService()
+	client := &simpleBlobClient{
+		client:    &blobService,
+		container: container,
+	}
+
+	return NewFromClient(client, container, rootDirectory)
 }
 
 // Implement the storagedriver.StorageDriver interface.
@@ -128,7 +225,7 @@ func (d *driver) Name() string {
 
 // GetContent retrieves the content stored at "path" as a []byte.
 func (d *driver) GetContent(ctx context.Context, path string) ([]byte, error) {
-	blobRef := d.client.GetContainerReference(d.container).GetBlobReference(d.blobPath(path))
+	blobRef := d.client.GetBlobReference(d.blobPath(path))
 	blob, err := blobRef.Get(nil)
 	if err != nil {
 		if is404(err) {
@@ -161,7 +258,7 @@ func (d *driver) PutContent(ctx context.Context, path string, contents []byte) e
 	// losing the existing data while migrating it to BlockBlob type. However,
 	// expectation is the clients pushing will be retrying when they get an error
 	// response.
-	blobRef := d.client.GetContainerReference(d.container).GetBlobReference(d.blobPath(path))
+	blobRef := d.client.GetBlobReference(d.blobPath(path))
 	err := blobRef.GetProperties(nil)
 	if err != nil && !is404(err) {
 		return fmt.Errorf("failed to get blob properties: %v", err)
@@ -181,7 +278,7 @@ func (d *driver) PutContent(ctx context.Context, path string, contents []byte) e
 // Reader retrieves an io.ReadCloser for the content stored at "path" with a
 // given byte offset.
 func (d *driver) Reader(ctx context.Context, path string, offset int64) (io.ReadCloser, error) {
-	blobRef := d.client.GetContainerReference(d.container).GetBlobReference(d.blobPath(path))
+	blobRef := d.client.GetBlobReference(d.blobPath(path))
 	if ok, err := blobRef.Exists(); err != nil {
 		return nil, err
 	} else if !ok {
@@ -213,7 +310,7 @@ func (d *driver) Reader(ctx context.Context, path string, offset int64) (io.Read
 // Writer returns a FileWriter which will store the content written to it
 // at the location designated by "path" after the call to Commit.
 func (d *driver) Writer(ctx context.Context, path string, append bool) (storagedriver.FileWriter, error) {
-	blobRef := d.client.GetContainerReference(d.container).GetBlobReference(d.blobPath(path))
+	blobRef := d.client.GetBlobReference(d.blobPath(path))
 	blobExists, err := blobRef.Exists()
 	if err != nil {
 		return nil, err
@@ -250,7 +347,7 @@ func (d *driver) Writer(ctx context.Context, path string, append bool) (storaged
 // in bytes and the creation time.
 func (d *driver) Stat(ctx context.Context, path string) (storagedriver.FileInfo, error) {
 	blobPath := d.blobPath(path)
-	blobRef := d.client.GetContainerReference(d.container).GetBlobReference(blobPath)
+	blobRef := d.client.GetBlobReference(blobPath)
 	// Check if the path is a blob
 	if ok, err := blobRef.Exists(); err != nil {
 		return nil, err
@@ -275,7 +372,7 @@ func (d *driver) Stat(ctx context.Context, path string) (storagedriver.FileInfo,
 		virtContainerPath += "/"
 	}
 
-	containerRef := d.client.GetContainerReference(d.container)
+	containerRef := d.client.GetContainerReference()
 	blobs, err := containerRef.ListBlobs(azure.ListBlobsParameters{
 		Prefix:     virtContainerPath,
 		MaxResults: 1,
@@ -317,9 +414,9 @@ func (d *driver) List(ctx context.Context, path string) ([]string, error) {
 // Move moves an object stored at sourcePath to destPath, removing the original
 // object.
 func (d *driver) Move(ctx context.Context, sourcePath string, destPath string) error {
-	srcBlobRef := d.client.GetContainerReference(d.container).GetBlobReference(d.blobPath(sourcePath))
+	srcBlobRef := d.client.GetBlobReference(d.blobPath(sourcePath))
 	sourceBlobURL := srcBlobRef.GetURL()
-	destBlobRef := d.client.GetContainerReference(d.container).GetBlobReference(d.blobPath(destPath))
+	destBlobRef := d.client.GetBlobReference(d.blobPath(destPath))
 	err := destBlobRef.Copy(sourceBlobURL, nil)
 	if err != nil {
 		if is404(err) {
@@ -333,7 +430,7 @@ func (d *driver) Move(ctx context.Context, sourcePath string, destPath string) e
 
 // Delete recursively deletes all objects stored at "path" and its subpaths.
 func (d *driver) Delete(ctx context.Context, path string) error {
-	blobRef := d.client.GetContainerReference(d.container).GetBlobReference(d.blobPath(path))
+	blobRef := d.client.GetBlobReference(d.blobPath(path))
 	ok, err := blobRef.DeleteIfExists(nil)
 	if err != nil {
 		return err
@@ -349,7 +446,7 @@ func (d *driver) Delete(ctx context.Context, path string) error {
 	}
 
 	for _, b := range blobs {
-		blobRef = d.client.GetContainerReference(d.container).GetBlobReference(d.blobPath(b))
+		blobRef = d.client.GetBlobReference(d.blobPath(b))
 		if err = blobRef.Delete(nil); err != nil {
 			return err
 		}
@@ -373,15 +470,8 @@ func (d *driver) URLFor(ctx context.Context, path string, options map[string]int
 			expiresTime = t
 		}
 	}
-	blobRef := d.client.GetContainerReference(d.container).GetBlobReference(d.blobPath(path))
-	return blobRef.GetSASURI(azure.BlobSASOptions{
-		BlobServiceSASPermissions: azure.BlobServiceSASPermissions{
-			Read: true,
-		},
-		SASOptions: azure.SASOptions{
-			Expiry: expiresTime,
-		},
-	})
+	blobRef := d.client.GetBlobReference(d.blobPath(path))
+	return d.client.GetURLFor(blobRef, expiresTime)
 }
 
 // Walk traverses a filesystem defined within driver, starting
@@ -442,7 +532,7 @@ func (d *driver) listBlobs(container, virtPath string) ([]string, error) {
 
 	out := []string{}
 	marker := ""
-	containerRef := d.client.GetContainerReference(d.container)
+	containerRef := d.client.GetContainerReference()
 	for {
 		resp, err := containerRef.ListBlobs(azure.ListBlobsParameters{
 			Marker: marker,
@@ -490,9 +580,8 @@ func (d *driver) newWriter(path string, size int64) storagedriver.FileWriter {
 		path:   path,
 		size:   size,
 		bw: bufio.NewWriterSize(&blockWriter{
-			client:    d.client,
-			container: d.container,
-			path:      path,
+			client: d.client,
+			path:   path,
 		}, maxChunkSize),
 	}
 }
@@ -530,7 +619,7 @@ func (w *writer) Cancel() error {
 		return fmt.Errorf("already committed")
 	}
 	w.cancelled = true
-	blobRef := w.driver.client.GetContainerReference(w.driver.container).GetBlobReference(w.path)
+	blobRef := w.driver.client.GetBlobReference(w.path)
 	return blobRef.Delete(nil)
 }
 
@@ -547,14 +636,13 @@ func (w *writer) Commit() error {
 }
 
 type blockWriter struct {
-	client    azure.BlobStorageClient
-	container string
-	path      string
+	client blobClient
+	path   string
 }
 
 func (bw *blockWriter) Write(p []byte) (int, error) {
 	n := 0
-	blobRef := bw.client.GetContainerReference(bw.container).GetBlobReference(bw.path)
+	blobRef := bw.client.GetBlobReference(bw.path)
 	for offset := 0; offset < len(p); offset += maxChunkSize {
 		chunkSize := maxChunkSize
 		if offset+chunkSize > len(p) {
