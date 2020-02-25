@@ -32,20 +32,21 @@ func init() {
 	)
 
 	config := []struct {
-		env   string
-		value *string
+		env       string
+		value     *string
+		missingOk bool
 	}{
-		{envAccountName, &accountName},
-		{envAccountKey, &accountKey},
-		{envContainer, &container},
-		{envRealm, &realm},
-		{envRootDirectory, &rootDirectory},
+		{envAccountName, &accountName, false},
+		{envAccountKey, &accountKey, false},
+		{envContainer, &container, false},
+		{envRealm, &realm, false},
+		{envRootDirectory, &rootDirectory, true},
 	}
 
 	missing := []string{}
 	for _, v := range config {
 		*v.value = os.Getenv(v.env)
-		if *v.value == "" {
+		if *v.value == "" && !v.missingOk {
 			missing = append(missing, v.env)
 		}
 	}

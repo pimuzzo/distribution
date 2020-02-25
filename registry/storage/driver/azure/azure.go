@@ -243,7 +243,7 @@ func (d *driver) Writer(ctx context.Context, path string, append bool) (storaged
 		}
 	}
 
-	return d.newWriter(path, size), nil
+	return d.newWriter(d.blobPath(path), size), nil
 }
 
 // Stat retrieves the FileInfo for the given path, including the current size
@@ -432,6 +432,14 @@ func (d *driver) listBlobs(container, virtPath string) ([]string, error) {
 	// we will replace the root directory prefix before returning blob names
 	blobPrefix := d.blobPath("")
 
+	// This is to cover for the cases when the rootDirectory of the driver is either "" or "/".
+	// In those cases, there is no root prefix to replace and we must actually add a "/" to all
+	// results in order to keep them as valid paths as recognized by storagedriver.PathRegexp
+	prefix := ""
+	if blobPrefix == "" {
+		prefix = "/"
+	}
+
 	out := []string{}
 	marker := ""
 	containerRef := d.client.GetContainerReference(d.container)
@@ -446,7 +454,7 @@ func (d *driver) listBlobs(container, virtPath string) ([]string, error) {
 		}
 
 		for _, b := range resp.Blobs {
-			out = append(out, strings.Replace(b.Name, blobPrefix, "", 1))
+			out = append(out, strings.Replace(b.Name, blobPrefix, prefix, 1))
 		}
 
 		if len(resp.Blobs) == 0 || resp.NextMarker == "" {
