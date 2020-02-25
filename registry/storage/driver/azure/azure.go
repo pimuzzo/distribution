@@ -73,7 +73,7 @@ func FromParameters(parameters map[string]interface{}) (*Driver, error) {
 		if err != nil {
 			return nil, err
 		}
-		return New(&api, fmt.Sprint(container), fmt.Sprint(rootDirectory))
+		return NewFromClient(&api, fmt.Sprint(container), fmt.Sprint(rootDirectory))
 	} else {
 		// else look for accountname, accountkey and realm
 		accountName, ok := parameters[paramAccountName]
@@ -91,16 +91,12 @@ func FromParameters(parameters map[string]interface{}) (*Driver, error) {
 			realm = azure.DefaultBaseURL
 		}
 
-		api, err := azure.NewClient(fmt.Sprint(accountName), fmt.Sprint(accountKey), fmt.Sprint(realm), azure.DefaultAPIVersion, true)
-		if err != nil {
-			return nil, err
-		}
-		return New(&api, fmt.Sprint(container), fmt.Sprint(rootDirectory))
+		return New(fmt.Sprint(accountName), fmt.Sprint(accountKey), fmt.Sprint(container), fmt.Sprint(realm), fmt.Sprint(rootDirectory))
 	}
 }
 
 // New constructs a new Driver with the given Azure Storage Account credentials
-func New(api *azure.Client, container string, rootDirectory string) (*Driver, error) {
+func NewFromClient(api *azure.Client, container string, rootDirectory string) (*Driver, error) {
 	blobClient := api.GetBlobService()
 
 	// Create registry container
@@ -114,6 +110,15 @@ func New(api *azure.Client, container string, rootDirectory string) (*Driver, er
 		container:     container,
 		rootDirectory: rootDirectory}
 	return &Driver{baseEmbed: baseEmbed{Base: base.Base{StorageDriver: d}}}, nil
+}
+
+// New constructs a new Driver with the given Azure Storage Account credentials
+func New(accountName, accountKey, container, realm, rootDirectory string) (*Driver, error) {
+	api, err := azure.NewClient(accountName, accountKey, realm, azure.DefaultAPIVersion, true)
+	if err != nil {
+		return nil, err
+	}
+	return NewFromClient(&api, container, rootDirectory)
 }
 
 // Implement the storagedriver.StorageDriver interface.
